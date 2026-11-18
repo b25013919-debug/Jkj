@@ -1,0 +1,922 @@
+--[[
+    ╔══════════════════════════════════════════════════════════════╗
+    ║                      GROK BLOXSTRIKE v2                      ║
+    ║              Исправленный + улучшенный скрипт                ║
+    ║                   Delta Executor (Android)                   ║
+    ╚══════════════════════════════════════════════════════════════╝
+]]
+
+-- Защита от повторного запуска
+if getgenv().GrokBloxStrikeLoaded then
+    warn("[Grok] Скрипт уже запущен! Перезагрузи игру если хочешь перезапустить.")
+    return
+end
+getgenv().GrokBloxStrikeLoaded = true
+
+-- Очистка старых соединений
+if getgenv().GrokConnections then
+    for _, conn in pairs(getgenv().GrokConnections) do
+        if typeof(conn) == "RBXScriptConnection" then
+            pcall(function() conn:Disconnect() end)
+        end
+    end
+end
+getgenv().GrokConnections = {}
+
+local function AddConnection(conn)
+    table.insert(getgenv().GrokConnections, conn)
+    return conn
+end
+
+-- Сервисы
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+local CoreGui = game:GetService("CoreGui")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- Настройки
+local Settings = {
+    -- Aimbot
+    AimbotEnabled = false,
+    AimbotSmooth = 0.22,
+    AimbotFOV = 220,
+    AimbotPart = "Head",
+    TeamCheck = true,
+    VisibleCheck = false,
+    Prediction = true,
+    PredictionAmount = 0.12,
+
+    -- ESP
+    ESP = false,
+    ESPBoxes = true,
+    ESPNames = true,
+    ESPHealth = true,
+    ESPDistance = true,
+    ESPColor = Color3.fromRGB(0, 255, 140),
+
+    -- Movement
+    BunnyHop = false,
+    ThirdPerson = false,
+    ThirdPersonDistance = 10,
+
+    -- Misc
+    NoRecoil = false,
+    SkyChanger = false,
+    HandsColorful = false,
+    HandsTransparent = false,
+    Aura = false,
+}
+
+-- Найденные ремоуты
+local FoundRemotes = {
+    Shoot = {},
+    Damage = {},
+    Hit = {},
+    Other = {},
+}
+
+-------------------------------------------------
+-- УТИЛИТЫ
+-------------------------------------------------
+local function IsAlive(player)
+    local char = player.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    return hum and hum.Health > 0 and root \~= nil
+end
+
+local function IsVisible(part)
+    if not Settings.VisibleCheck then return true end
+    local origin = Camera.CFrame.Position
+    local direction = (part.Position - origin)
+    local ray = Ray.new(origin, direction)
+    local hit = Workspace:FindPartOnRayWithIgnoreList(ray, {LocalPlayer.Character, Camera})
+    return hit == nil or hit:IsDescendantOf(part.Parent)
+end
+
+local function GetClosestPlayer()
+    local closest = nil
+    local shortest = Settings.AimbotFOV
+    local myChar = LocalPlayer.Character
+    local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+    if not myRoot then return nil end
+
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player \~= LocalPlayer and IsAlive(player) then
+            if Settings.TeamCheck then
+                local sameTeam = false
+                pcall(function()
+                    if player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
+                        sameTeam = true
+                    end
+                    if player.TeamColor and LocalPlayer.TeamColor and player.TeamColor == LocalPlayer.TeamColor then
+                        sameTeam = true
+                    end
+                end)
+                if sameTeam then continue end
+            end
+
+            local char = player.Character
+            local part = char:FindFirstChild(Settings.AimbotPart)
+                or char:FindFirstChild("Head")
+                or char:FindFirstChild("HumanoidRootPart")
+            if not part then continue end
+
+            if not IsVisible(part) then continue end
+
+            local screenPos, onScreen = Camera:WorldToViewportPoint(part.Position)
+            if onScreen and screenPos.Z > 0 then
+                local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+                if dist < shortest then
+                    shortest = dist
+                    closest = part
+                end
+            end
+        end
+    end
+    return closest
+end
+
+local function CreateTween(obj, props, time)
+    local t = TweenService:Create(obj, TweenInfo.new(time or 0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props)
+    t:Play()
+    return t
+end
+
+-------------------------------------------------
+-- АВТО-ПОИСК РЕМОУТОВ
+-------------------------------------------------
+local function ScanRemotes()
+    print("[Grok] ===== Начинаю поиск RemoteEvents/Functions =====")
+
+    local keywords = {
+        shoot = "Shoot",
+        fire = "Shoot",
+        bullet = "Shoot",
+        gun = "Shoot",
+        shot = "Shoot",
+        damage = "Damage",
+        hit = "Hit",
+        hurt = "Damage",
+        attack = "Shoot",
+        weapon = "Shoot",
+        projectile = "Shoot",
+        ray = "Shoot",
+        impact = "Hit",
+        kill = "Damage",
+    }
+
+    local function checkName(name)
+        local lower = string.lower(name)
+        for key, category in pairs(keywords) do
+            if string.find(lower, key) then
+                return category
+            end
+        end
+        return "Other"
+    end
+
+    local function scan(obj)
+        for _, child in ipairs(obj:GetDescendants()) do
+            if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+                local category = checkName(child.Name)
+                table.insert(FoundRemotes[category], {
+                    Remote = child,
+                    Name = child.Name,
+                    Class = child.ClassName,
+                    Path = child:GetFullName()
+                })
+                print(string.format("[Grok] [%s] %s (%s)", category, child:GetFullName(), child.ClassName))
+            end
+        end
+    end
+
+    pcall(function() scan(ReplicatedStorage) end)
+    pcall(function() scan(Workspace) end)
+    pcall(function()
+        if LocalPlayer.Character then
+            scan(LocalPlayer.Character)
+        end
+    end)
+    pcall(function()
+        if LocalPlayer:FindFirstChild("Backpack") then
+            scan(LocalPlayer.Backpack)
+        end
+    end)
+
+    AddConnection(LocalPlayer.CharacterAdded:Connect(function(char)
+        task.wait(1.5)
+        pcall(function()
+            for _, child in ipairs(char:GetDescendants()) do
+                if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+                    local category = checkName(child.Name)
+                    table.insert(FoundRemotes[category], {
+                        Remote = child,
+                        Name = child.Name,
+                        Class = child.ClassName,
+                        Path = child:GetFullName()
+                    })
+                    print(string.format("[Grok] [NEW] [%s] %s", category, child:GetFullName()))
+                end
+            end
+        end)
+    end))
+
+    local total = #FoundRemotes.Shoot + #FoundRemotes.Damage + #FoundRemotes.Hit + #FoundRemotes.Other
+    print("[Grok] ===== Найдено ремоутов: " .. total .. " =====")
+    print("[Grok] Shoot: " .. #FoundRemotes.Shoot .. " | Damage: " .. #FoundRemotes.Damage .. " | Hit: " .. #FoundRemotes.Hit .. " | Other: " .. #FoundRemotes.Other)
+
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Grok BloxStrike",
+            Text = "Найдено ремоутов: " .. total .. "\nShoot: " .. #FoundRemotes.Shoot,
+            Duration = 5
+        })
+    end)
+end
+
+-------------------------------------------------
+-- ESP
+-------------------------------------------------
+local ESPObjects = {}
+
+local function ClearESP()
+    for player, data in pairs(ESPObjects) do
+        if data.Highlight then pcall(function() data.Highlight:Destroy() end) end
+        if data.Billboard then pcall(function() data.Billboard:Destroy() end) end
+    end
+    ESPObjects = {}
+end
+
+local function UpdateESP()
+    if not Settings.ESP then
+        ClearESP()
+        return
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+
+        if not IsAlive(player) then
+            if ESPObjects[player] then
+                if ESPObjects[player].Highlight then pcall(function() ESPObjects[player].Highlight:Destroy() end) end
+                if ESPObjects[player].Billboard then pcall(function() ESPObjects[player].Billboard:Destroy() end) end
+                ESPObjects[player] = nil
+            end
+            continue
+        end
+
+        if Settings.TeamCheck then
+            local sameTeam = false
+            pcall(function()
+                if player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then
+                    sameTeam = true
+                end
+            end)
+            if sameTeam then
+                if ESPObjects[player] then
+                    if ESPObjects[player].Highlight then pcall(function() ESPObjects[player].Highlight:Destroy() end) end
+                    if ESPObjects[player].Billboard then pcall(function() ESPObjects[player].Billboard:Destroy() end) end
+                    ESPObjects[player] = nil
+                end
+                continue
+            end
+        end
+
+        local char = player.Character
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local head = char:FindFirstChild("Head")
+        if not root or not hum then continue end
+
+        if not ESPObjects[player] then
+            ESPObjects[player] = {}
+
+            if Settings.ESPBoxes then
+                local hl = Instance.new("Highlight")
+                hl.FillColor = Settings.ESPColor
+                hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+                hl.FillTransparency = 0.65
+                hl.OutlineTransparency = 0.2
+                hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                hl.Parent = char
+                ESPObjects[player].Highlight = hl
+            end
+
+            local bb = Instance.new("BillboardGui")
+            bb.Size = UDim2.new(0, 140, 0, 50)
+            bb.StudsOffset = Vector3.new(0, 3.2, 0)
+            bb.AlwaysOnTop = true
+            bb.Adornee = head or root
+            bb.Parent = CoreGui
+
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Size = UDim2.new(1, 0, 0, 18)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Text = player.Name
+            nameLabel.TextColor3 = Settings.ESPColor
+            nameLabel.TextSize = 13
+            nameLabel.Font = Enum.Font.GothamBold
+            nameLabel.TextStrokeTransparency = 0.4
+            nameLabel.Parent = bb
+
+            local distLabel = Instance.new("TextLabel")
+            distLabel.Size = UDim2.new(1, 0, 0, 16)
+            distLabel.Position = UDim2.new(0, 0, 0, 16)
+            distLabel.BackgroundTransparency = 1
+            distLabel.Text = "0m"
+            distLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+            distLabel.TextSize = 11
+            distLabel.Font = Enum.Font.Gotham
+            distLabel.TextStrokeTransparency = 0.5
+            distLabel.Parent = bb
+
+            local hpLabel = Instance.new("TextLabel")
+            hpLabel.Size = UDim2.new(1, 0, 0, 14)
+            hpLabel.Position = UDim2.new(0, 0, 0, 30)
+            hpLabel.BackgroundTransparency = 1
+            hpLabel.Text = "100 HP"
+            hpLabel.TextColor3 = Color3.fromRGB(0, 255, 100)
+            hpLabel.TextSize = 11
+            hpLabel.Font = Enum.Font.GothamBold
+            hpLabel.TextStrokeTransparency = 0.5
+            hpLabel.Parent = bb
+
+            ESPObjects[player].Billboard = bb
+            ESPObjects[player].NameLabel = nameLabel
+            ESPObjects[player].DistLabel = distLabel
+            ESPObjects[player].HpLabel = hpLabel
+        end
+
+        local data = ESPObjects[player]
+        local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if myRoot and data.DistLabel then
+            local dist = math.floor((myRoot.Position - root.Position).Magnitude)
+            data.DistLabel.Text = dist .. "m"
+            data.DistLabel.Visible = Settings.ESPDistance
+        end
+
+        if data.NameLabel then
+            data.NameLabel.Visible = Settings.ESPNames
+            data.NameLabel.Text = player.Name
+        end
+
+        if data.HpLabel and hum then
+            local hp = math.floor(hum.Health)
+            data.HpLabel.Text = hp .. " HP"
+            data.HpLabel.Visible = Settings.ESPHealth
+            if hp > 70 then
+                data.HpLabel.TextColor3 = Color3.fromRGB(0, 255, 100)
+            elseif hp > 30 then
+                data.HpLabel.TextColor3 = Color3.fromRGB(255, 200, 0)
+            else
+                data.HpLabel.TextColor3 = Color3.fromRGB(255, 60, 60)
+            end
+        end
+
+        if data.Highlight then
+            data.Highlight.Enabled = Settings.ESPBoxes
+            data.Highlight.FillColor = Settings.ESPColor
+        end
+    end
+end
+
+-------------------------------------------------
+-- HANDS / AURA
+-------------------------------------------------
+local AuraInstance = nil
+
+local function UpdateHands()
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            local name = part.Name:lower()
+            if name:find("arm") or name:find("hand") or name == "left arm" or name == "right arm" then
+                if Settings.HandsTransparent then
+                    part.Transparency = 0.55
+                else
+                    part.Transparency = 0
+                end
+                if Settings.HandsColorful then
+                    part.Color = Color3.fromHSV((tick() % 4) / 4, 0.85, 1)
+                end
+            end
+        end
+    end
+end
+
+local function UpdateAura()
+    if AuraInstance then
+        pcall(function() AuraInstance:Destroy() end)
+        AuraInstance = nil
+    end
+    if not Settings.Aura then return end
+
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    local hl = Instance.new("Highlight")
+    hl.FillColor = Color3.fromRGB(0, 255, 140)
+    hl.OutlineColor = Color3.fromRGB(0, 200, 120)
+    hl.FillTransparency = 0.72
+    hl.OutlineTransparency = 0.25
+    hl.Parent = char
+    AuraInstance = hl
+end
+
+-------------------------------------------------
+-- МЕНЮ
+-------------------------------------------------
+local ScreenGui, MainFrame, ToggleBtn
+local MenuOpen = true
+
+local function CreateMenu()
+    pcall(function()
+        if CoreGui:FindFirstChild("GrokBloxStrikeUI") then
+            CoreGui.GrokBloxStrikeUI:Destroy()
+        end
+    end)
+
+    ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "GrokBloxStrikeUI"
+    ScreenGui.IgnoreGuiInset = true
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    pcall(function() ScreenGui.Parent = CoreGui end)
+    if not ScreenGui.Parent then
+        ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    -- FLOATING TOGGLE BUTTON
+    ToggleBtn = Instance.new("TextButton")
+    ToggleBtn.Name = "ToggleBtn"
+    ToggleBtn.Size = UDim2.new(0, 58, 0, 58)
+    ToggleBtn.Position = UDim2.new(0, 12, 0.45, 0)
+    ToggleBtn.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
+    ToggleBtn.Text = "G"
+    ToggleBtn.TextColor3 = Color3.fromRGB(10, 10, 14)
+    ToggleBtn.TextSize = 26
+    ToggleBtn.Font = Enum.Font.GothamBlack
+    ToggleBtn.AutoButtonColor = false
+    ToggleBtn.Parent = ScreenGui
+
+    local toggleCorner = Instance.new("UICorner")
+    toggleCorner.CornerRadius = UDim.new(1, 0)
+    toggleCorner.Parent = ToggleBtn
+
+    local toggleStroke = Instance.new("UIStroke")
+    toggleStroke.Color = Color3.fromRGB(255, 255, 255)
+    toggleStroke.Thickness = 2
+    toggleStroke.Transparency = 0.3
+    toggleStroke.Parent = ToggleBtn
+
+    -- MAIN FRAME
+    MainFrame = Instance.new("Frame")
+    MainFrame.Name = "Main"
+    MainFrame.Size = UDim2.new(0, 340, 0, 460)
+    MainFrame.Position = UDim2.new(0.5, -170, 0.5, -230)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(14, 14, 20)
+    MainFrame.BorderSizePixel = 0
+    MainFrame.Parent = ScreenGui
+
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 16)
+    mainCorner.Parent = MainFrame
+
+    local mainStroke = Instance.new("UIStroke")
+    mainStroke.Color = Color3.fromRGB(0, 255, 140)
+    mainStroke.Thickness = 1.5
+    mainStroke.Transparency = 0.4
+    mainStroke.Parent = MainFrame
+
+    local TopBar = Instance.new("Frame")
+    TopBar.Size = UDim2.new(1, 0, 0, 52)
+    TopBar.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+    TopBar.BorderSizePixel = 0
+    TopBar.Parent = MainFrame
+
+    local topCorner = Instance.new("UICorner")
+    topCorner.CornerRadius = UDim.new(0, 16)
+    topCorner.Parent = TopBar
+
+    local topFix = Instance.new("Frame")
+    topFix.Size = UDim2.new(1, 0, 0, 20)
+    topFix.Position = UDim2.new(0, 0, 1, -20)
+    topFix.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+    topFix.BorderSizePixel = 0
+    topFix.Parent = TopBar
+
+    local Logo = Instance.new("TextLabel")
+    Logo.Size = UDim2.new(0, 160, 1, 0)
+    Logo.Position = UDim2.new(0, 16, 0, 0)
+    Logo.BackgroundTransparency = 1
+    Logo.Text = "GROK BLOX"
+    Logo.TextColor3 = Color3.fromRGB(0, 255, 140)
+    Logo.TextSize = 18
+    Logo.Font = Enum.Font.GothamBlack
+    Logo.TextXAlignment = Enum.TextXAlignment.Left
+    Logo.Parent = TopBar
+
+    local Ver = Instance.new("TextLabel")
+    Ver.Size = UDim2.new(0, 70, 1, 0)
+    Ver.Position = UDim2.new(1, -80, 0, 0)
+    Ver.BackgroundTransparency = 1
+    Ver.Text = "v2.0"
+    Ver.TextColor3 = Color3.fromRGB(120, 120, 130)
+    Ver.TextSize = 12
+    Ver.Font = Enum.Font.Gotham
+    Ver.TextXAlignment = Enum.TextXAlignment.Right
+    Ver.Parent = TopBar
+
+    local TabBar = Instance.new("Frame")
+    TabBar.Size = UDim2.new(1, -20, 0, 38)
+    TabBar.Position = UDim2.new(0, 10, 0, 58)
+    TabBar.BackgroundTransparency = 1
+    TabBar.Parent = MainFrame
+
+    local Tabs = {"Combat", "Visuals", "Movement", "Misc"}
+    local TabButtons = {}
+    local ContentFrame
+
+    local function ClearContent()
+        if ContentFrame then
+            ContentFrame:Destroy()
+        end
+        ContentFrame = Instance.new("ScrollingFrame")
+        ContentFrame.Size = UDim2.new(1, -20, 1, -110)
+        ContentFrame.Position = UDim2.new(0, 10, 0, 102)
+        ContentFrame.BackgroundTransparency = 1
+        ContentFrame.ScrollBarThickness = 3
+        ContentFrame.ScrollBarImageColor3 = Color3.fromRGB(0, 255, 140)
+        ContentFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+        ContentFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+        ContentFrame.Parent = MainFrame
+
+        local layout = Instance.new("UIListLayout")
+        layout.Padding = UDim.new(0, 7)
+        layout.SortOrder = Enum.SortOrder.LayoutOrder
+        layout.Parent = ContentFrame
+    end
+
+    local function CreateToggle(text, default, callback)
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 0, 50)
+        frame.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+        frame.BorderSizePixel = 0
+        frame.Parent = ContentFrame
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = frame
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -70, 1, 0)
+        label.Position = UDim2.new(0, 14, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(230, 230, 240)
+        label.TextSize = 14
+        label.Font = Enum.Font.GothamMedium
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = frame
+
+        local switch = Instance.new("Frame")
+        switch.Size = UDim2.new(0, 48, 0, 28)
+        switch.Position = UDim2.new(1, -60, 0.5, 0)
+        switch.AnchorPoint = Vector2.new(0, 0.5)
+        switch.BackgroundColor3 = default and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(45, 45, 55)
+        switch.Parent = frame
+
+        local switchCorner = Instance.new("UICorner")
+        switchCorner.CornerRadius = UDim.new(1, 0)
+        switchCorner.Parent = switch
+
+        local circle = Instance.new("Frame")
+        circle.Size = UDim2.new(0, 22, 0, 22)
+        circle.Position = default and UDim2.new(1, -25, 0.5, 0) or UDim2.new(0, 3, 0.5, 0)
+        circle.AnchorPoint = Vector2.new(0, 0.5)
+        circle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        circle.Parent = switch
+
+        local circleCorner = Instance.new("UICorner")
+        circleCorner.CornerRadius = UDim.new(1, 0)
+        circleCorner.Parent = circle
+
+        local enabled = default
+
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 1, 0)
+        btn.BackgroundTransparency = 1
+        btn.Text = ""
+        btn.Parent = frame
+
+        btn.MouseButton1Click:Connect(function()
+            enabled = not enabled
+            CreateTween(switch, {BackgroundColor3 = enabled and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(45, 45, 55)}, 0.18)
+            CreateTween(circle, {Position = enabled and UDim2.new(1, -25, 0.5, 0) or UDim2.new(0, 3, 0.5, 0)}, 0.18)
+            if callback then
+                pcall(callback, enabled)
+            end
+        end)
+    end
+
+    local function CreateSection(title)
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 0, 26)
+        frame.BackgroundTransparency = 1
+        frame.Parent = ContentFrame
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, 0, 1, 0)
+        label.BackgroundTransparency = 1
+        label.Text = title
+        label.TextColor3 = Color3.fromRGB(0, 255, 140)
+        label.TextSize = 12
+        label.Font = Enum.Font.GothamBold
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = frame
+    end
+
+    local function ShowTab(name)
+        for t, btn in pairs(TabButtons) do
+            if t == name then
+                btn.BackgroundColor3 = Color3.fromRGB(0, 255, 140)
+                btn.TextColor3 = Color3.fromRGB(10, 10, 14)
+            else
+                btn.BackgroundColor3 = Color3.fromRGB(28, 28, 38)
+                btn.TextColor3 = Color3.fromRGB(170, 170, 180)
+            end
+        end
+
+        ClearContent()
+
+        if name == "Combat" then
+            CreateSection("AIMBOT")
+            CreateToggle("Rage Aimbot", Settings.AimbotEnabled, function(v) Settings.AimbotEnabled = v end)
+            CreateToggle("Team Check", Settings.TeamCheck, function(v) Settings.TeamCheck = v end)
+            CreateToggle("Visible Check", Settings.VisibleCheck, function(v) Settings.VisibleCheck = v end)
+            CreateToggle("Prediction", Settings.Prediction, function(v) Settings.Prediction = v end)
+
+            CreateSection("WEAPON")
+            CreateToggle("No Recoil (Exp)", Settings.NoRecoil, function(v) Settings.NoRecoil = v end)
+
+        elseif name == "Visuals" then
+            CreateSection("ESP")
+            CreateToggle("ESP Enabled", Settings.ESP, function(v)
+                Settings.ESP = v
+                if not v then ClearESP() end
+            end)
+            CreateToggle("Boxes (Highlight)", Settings.ESPBoxes, function(v) Settings.ESPBoxes = v end)
+            CreateToggle("Names", Settings.ESPNames, function(v) Settings.ESPNames = v end)
+            CreateToggle("Health", Settings.ESPHealth, function(v) Settings.ESPHealth = v end)
+            CreateToggle("Distance", Settings.ESPDistance, function(v) Settings.ESPDistance = v end)
+
+            CreateSection("CHARACTER")
+            CreateToggle("Colorful Hands", Settings.HandsColorful, function(v)
+                Settings.HandsColorful = v
+                UpdateHands()
+            end)
+            CreateToggle("Transparent Hands", Settings.HandsTransparent, function(v)
+                Settings.HandsTransparent = v
+                UpdateHands()
+            end)
+            CreateToggle("Aura", Settings.Aura, function(v)
+                Settings.Aura = v
+                UpdateAura()
+            end)
+
+            CreateSection("WORLD")
+            CreateToggle("Cool Sky", Settings.SkyChanger, function(v)
+                Settings.SkyChanger = v
+                if v then
+                    pcall(function()
+                        Lighting.ClockTime = 14
+                        Lighting.Brightness = 2.4
+                        Lighting.Ambient = Color3.fromRGB(70, 90, 130)
+                        Lighting.OutdoorAmbient = Color3.fromRGB(90, 110, 150)
+                    end)
+                end
+            end)
+
+        elseif name == "Movement" then
+            CreateSection("MOVEMENT")
+            CreateToggle("Bunny Hop", Settings.BunnyHop, function(v) Settings.BunnyHop = v end)
+            CreateToggle("Third Person", Settings.ThirdPerson, function(v)
+                Settings.ThirdPerson = v
+                if v then
+                    pcall(function()
+                        LocalPlayer.CameraMaxZoomDistance = Settings.ThirdPersonDistance
+                        LocalPlayer.CameraMinZoomDistance = Settings.ThirdPersonDistance
+                        LocalPlayer.CameraMode = Enum.CameraMode.Classic
+                    end)
+                else
+                    pcall(function()
+                        LocalPlayer.CameraMode = Enum.CameraMode.LockFirstPerson
+                    end)
+                end
+            end)
+
+        elseif name == "Misc" then
+            CreateSection("INFO")
+            local info = Instance.new("TextLabel")
+            info.Size = UDim2.new(1, 0, 0, 90)
+            info.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+            info.Text = "BloxStrike — 5v5 тактический шутер\nв стиле CS.\n\nРемоуты найдены автоматически.\nСмотри консоль (F9 / Log)."
+            info.TextColor3 = Color3.fromRGB(180, 180, 190)
+            info.TextSize = 13
+            info.Font = Enum.Font.Gotham
+            info.TextWrapped = true
+            info.Parent = ContentFrame
+
+            local infoCorner = Instance.new("UICorner")
+            infoCorner.CornerRadius = UDim.new(0, 10)
+            infoCorner.Parent = info
+
+            CreateSection("REMOTES")
+            local remoteInfo = Instance.new("TextLabel")
+            remoteInfo.Size = UDim2.new(1, 0, 0, 70)
+            remoteInfo.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+            remoteInfo.Text = "Shoot: " .. #FoundRemotes.Shoot .. "\nDamage: " .. #FoundRemotes.Damage .. "\nHit: " .. #FoundRemotes.Hit .. "\nOther: " .. #FoundRemotes.Other
+            remoteInfo.TextColor3 = Color3.fromRGB(0, 255, 140)
+            remoteInfo.TextSize = 13
+            remoteInfo.Font = Enum.Font.GothamBold
+            remoteInfo.Parent = ContentFrame
+
+            local rCorner = Instance.new("UICorner")
+            rCorner.CornerRadius = UDim.new(0, 10)
+            rCorner.Parent = remoteInfo
+
+            CreateSection("ACTIONS")
+            local rescanBtn = Instance.new("TextButton")
+            rescanBtn.Size = UDim2.new(1, 0, 0, 48)
+            rescanBtn.BackgroundColor3 = Color3.fromRGB(0, 180, 100)
+            rescanBtn.Text = "Пересканировать ремоуты"
+            rescanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            rescanBtn.TextSize = 14
+            rescanBtn.Font = Enum.Font.GothamBold
+            rescanBtn.Parent = ContentFrame
+
+            local rbCorner = Instance.new("UICorner")
+            rbCorner.CornerRadius = UDim.new(0, 10)
+            rbCorner.Parent = rescanBtn
+
+            rescanBtn.MouseButton1Click:Connect(function()
+                FoundRemotes = {Shoot = {}, Damage = {}, Hit = {}, Other = {}}
+                ScanRemotes()
+                ShowTab("Misc")
+            end)
+        end
+    end
+
+    for i, name in ipairs(Tabs) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1 / #Tabs, -4, 1, 0)
+        btn.Position = UDim2.new((i - 1) / #Tabs, 2, 0, 0)
+        btn.BackgroundColor3 = i == 1 and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(28, 28, 38)
+        btn.Text = name
+        btn.TextColor3 = i == 1 and Color3.fromRGB(10, 10, 14) or Color3.fromRGB(170, 170, 180)
+        btn.TextSize = 12
+        btn.Font = Enum.Font.GothamBold
+        btn.AutoButtonColor = false
+        btn.Parent = TabBar
+
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 8)
+        c.Parent = btn
+
+        TabButtons[name] = btn
+
+        btn.MouseButton1Click:Connect(function()
+            ShowTab(name)
+        end)
+    end
+
+    ToggleBtn.MouseButton1Click:Connect(function()
+        MenuOpen = not MenuOpen
+        MainFrame.Visible = MenuOpen
+        CreateTween(ToggleBtn, {
+            BackgroundColor3 = MenuOpen and Color3.fromRGB(0, 255, 140) or Color3.fromRGB(40, 40, 50)
+        }, 0.2)
+    end)
+
+    -- Перетаскивание кнопки G
+    local dragging = false
+    local dragStart, startPos
+
+    ToggleBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = ToggleBtn.Position
+        end
+    end)
+
+    ToggleBtn.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+
+    AddConnection(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local delta = input.Position - dragStart
+            ToggleBtn.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+
+    ShowTab("Combat")
+end
+
+-------------------------------------------------
+-- ОСНОВНОЙ ЦИКЛ
+-------------------------------------------------
+AddConnection(RunService.RenderStepped:Connect(function()
+    if Settings.AimbotEnabled then
+        local target = GetClosestPlayer()
+        if target then
+            local camPos = Camera.CFrame.Position
+            local targetPos = target.Position
+
+            if Settings.Prediction then
+                local velocity = Vector3.zero
+                pcall(function()
+                    local root = target.Parent and target.Parent:FindFirstChild("HumanoidRootPart")
+                    if root then
+                        velocity = root.AssemblyLinearVelocity
+                    end
+                end)
+                targetPos = targetPos + (velocity * Settings.PredictionAmount)
+            end
+
+            local lookAt = CFrame.new(camPos, targetPos)
+            Camera.CFrame = Camera.CFrame:Lerp(lookAt, 1 - Settings.AimbotSmooth)
+        end
+    end
+
+    if Settings.BunnyHop then
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.FloorMaterial \~= Enum.Material.Air then
+                hum.Jump = true
+            end
+        end
+    end
+
+    if Settings.HandsColorful then
+        UpdateHands()
+    end
+end))
+
+AddConnection(RunService.Heartbeat:Connect(function()
+    if Settings.ESP then
+        UpdateESP()
+    end
+end))
+
+AddConnection(LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(1.2)
+    if Settings.Aura then UpdateAura() end
+    if Settings.HandsColorful or Settings.HandsTransparent then UpdateHands() end
+end))
+
+-------------------------------------------------
+-- СТАРТ
+-------------------------------------------------
+task.spawn(function()
+    task.wait(1)
+
+    ScanRemotes()
+    CreateMenu()
+
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Grok BloxStrike v2",
+            Text = "Скрипт загружен!\nНажми зелёную кнопку G",
+            Duration = 6
+        })
+    end)
+
+    print("[Grok] ================================")
+    print("[Grok] BloxStrike v2 загружен успешно!")
+    print("[Grok] Нажми зелёную кнопку G чтобы открыть меню")
+    print("[Grok] ================================")
+end)
